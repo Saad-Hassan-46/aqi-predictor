@@ -1,22 +1,29 @@
-import requests
-import os
 from pathlib import Path
 from dotenv import load_dotenv
+import os
+import hopsworks
 
 load_dotenv(dotenv_path=Path(r"D:\Internship Project\aqi-predictor") / ".env")
 
-key = os.getenv("OPENAQ_API_KEY")
-print("Key:", repr(key))
-
-r = requests.get(
-    "https://api.openaq.org/v3/locations",
-    params={
-        "coordinates": "33.7235,73.11822",
-        "radius": 25000,
-        "limit": 10
-    },
-    headers={"X-API-Key": key}
+project = hopsworks.login(
+    api_key_value=os.getenv("PDNDYtjehc4whxLP.0HAPAs4ZShvlnuUeyJmSuw4xwPBN3pfwCdhqVYaKspUMdwHlUg0NopCBRNclB6au"),
+    project=os.getenv("aqi_predictor_model")
 )
 
-print("Status:", r.status_code)
-print(r.text)
+fs = project.get_feature_store()
+
+fg = fs.get_feature_group(
+    "aqi_features",
+    version=1
+)
+
+df = fg.read()
+
+print("Total rows:", len(df))
+print("Date range:", df["timestamp"].min(), "to", df["timestamp"].max())
+
+print(
+    df[["timestamp", "aqi", "pm25", "temperature"]]
+    .sort_values("timestamp")
+    .head(10)
+)
