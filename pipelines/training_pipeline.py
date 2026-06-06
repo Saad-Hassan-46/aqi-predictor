@@ -1,27 +1,22 @@
 """
 training_pipeline.py
 ---------------------
-Reads features from the Hopsworks feature store, engineers lag/rolling
-features, trains four model families (Ridge, RandomForest, XGBoost, LSTM),
-evaluates them, and registers the best model to the Hopsworks Model Registry.
-
-Forecast task: predict AQI at +24 h, +48 h, and +72 h ahead
-(multi-output regression, one row of outputs per input window).
+Fetches features from Hopsworks, engineers lag features, trains and
+compares multiple ML models, and registers the best one in the
+Hopsworks Model Registry.
 
 Run manually:
-    python pipelines/training_pipeline.py
+    py -3.11 training_pipeline.py
 
-Force a specific model to be registered regardless of metric:
-    python pipelines/training_pipeline.py --force-model xgboost
+Run with specific lookback window:
+    py -3.11 training_pipeline.py --lookback 14
 """
 
 import argparse
-import json
 import logging
 import os
 import sys
-import tempfile
-from datetime import datetime, timezone
+import warnings
 from pathlib import Path
 
 import hopsworks
@@ -29,49 +24,20 @@ import joblib
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-import xgboost as xgb
 
+warnings.filterwarnings("ignore")
 
-# ── Environment ───────────────────────────────────────────────────────────────
+# ── Load environment ──────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
-# Fix Hopsworks /tmp path issue on Windows
-tmpdir = os.getenv("HOPSWORKS_TMPDIR")
-if tmpdir:
-    tempfile.tempdir = tmpdir
-
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
-HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model")
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-FEATURE_GROUP_NAME    = "aqi_features"
-FEATURE_GROUP_VERSION = 1
-MODEL_NAME            = "aqi_forecaster"
-MODEL_VERSION         = 1
-
-LOOKBACK_HOURS  = 72   # input window fed to LSTM; also controls lag depth
-FORECAST_HORIZONS = [24, 48, 72]   # hours ahead to predict (3-day forecast)
-TEST_SIZE_DAYS  = 14
-RANDOM_STATE    = 42
-
-# Raw + engineered feature columns that exist in the feature store
-# (we add lag/rolling columns on top of these during training)
-BASE_FEATURE_COLS = [
-    "aqi", "pm25", "pm10", "no2", "o3", "so2", "co",
-    "temperature", "humidity", "pressure",
-    "wind_speed", "wind_direction", "visibility",
-    "hour", "day", "month", "weekday", "season", "is_weekend",
-    "hour_sin", "hour_cos", "month_sin", "month_cos",
-    "weekday_sin", "weekday_cos",
-    "temp_humidity_index", "wind_dispersion", "atmospheric_stability",
-    "aqi_change_rate",
-]
+HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -81,576 +47,305 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+MODEL_DIR    = Path(__file__).resolve().parent.parent / "models"
+TEST_DAYS    = 30
+RANDOM_STATE = 42
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — DATA LOADING
+# SECTION 1 — FETCH FEATURES FROM HOPSWORKS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_features_from_store() -> pd.DataFrame:
+def fetch_features(project) -> pd.DataFrame:
     """
-    Pull all rows from the aqi_features feature group.
-
-    Returns a DataFrame sorted chronologically with a proper DatetimeIndex.
+    Read all rows from the aqi_features feature group.
+    Returns a DataFrame sorted by timestamp ascending.
     """
-    log.info("Connecting to Hopsworks...")
-    project = hopsworks.login(
-        api_key_value=HOPSWORKS_API_KEY,
-        project=HOPSWORKS_PROJECT,
-    )
+    log.info("Fetching features from Hopsworks feature store...")
     fs = project.get_feature_store()
-
-    log.info(f"Reading feature group '{FEATURE_GROUP_NAME}' v{FEATURE_GROUP_VERSION}...")
-    fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
+    fg = fs.get_feature_group("aqi_features", version=1)
     df = fg.read()
-
-    log.info(f"  Loaded {len(df):,} rows, {len(df.columns)} columns.")
-
-    # Coerce timestamp and sort
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df = df.set_index("timestamp")
-
+    log.info(f"Fetched {len(df)} rows spanning {df['timestamp'].min()} to {df['timestamp'].max()}")
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — FEATURE ENGINEERING (LAG + ROLLING)
+# SECTION 2 — LAG FEATURE ENGINEERING
+# Computed here (not in feature_pipeline.py) because they require the full
+# dataset to look back across multiple rows.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def add_lag_and_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+def engineer_lag_features(df: pd.DataFrame, lookback_days: int = 7) -> pd.DataFrame:
     """
-    Add lag and rolling-window features on top of what the feature pipeline
-    already computed.  These are calculated here (not in the feature pipeline)
-    because computing them there would require fetching history on every hourly
-    run, which is slow and fragile.
+    Add lag and rolling average features to the dataset.
 
-    Lags capture short-term autocorrelation; rolling windows capture trend.
-    All shifts are in hours (1 row = 1 hour).
+    Why lag features matter for AQI forecasting:
+    - Yesterday's AQI is the single strongest predictor of today's AQI
+    - Rolling averages smooth out noise and capture trends
+    - Change rates capture whether air quality is improving or worsening
+
+    Args:
+        df: Feature DataFrame sorted by timestamp
+        lookback_days: Number of past days to create lag features for
+
+    Returns:
+        DataFrame with lag features added, NaN rows dropped
     """
-    log.info("Engineering lag and rolling features...")
+    log.info(f"Engineering lag features (lookback={lookback_days} days)...")
+    df = df.copy()
 
-    aqi = df["aqi"]
+    # Lag features: AQI values from past N days
+    for lag in [1, 2, 3, 7, 14]:
+        if lag <= lookback_days:
+            df[f"aqi_lag_{lag}d"] = df["aqi"].shift(lag)
 
-    # Point-in-time lags (how bad was the air 1h / 6h / 24h / 48h / 72h ago?)
-    for lag_h in [1, 6, 24, 48, 72]:
-        df[f"aqi_lag_{lag_h}h"] = aqi.shift(lag_h)
+    # Rolling statistics
+    df["aqi_rolling_mean_3d"]  = df["aqi"].shift(1).rolling(window=3,  min_periods=1).mean()
+    df["aqi_rolling_mean_7d"]  = df["aqi"].shift(1).rolling(window=7,  min_periods=1).mean()
+    df["aqi_rolling_mean_14d"] = df["aqi"].shift(1).rolling(window=14, min_periods=1).mean()
+    df["aqi_rolling_std_7d"]   = df["aqi"].shift(1).rolling(window=7,  min_periods=2).std().fillna(0)
 
-    # Rolling statistics (local trend and volatility)
-    df["aqi_rolling_mean_6h"]  = aqi.shift(1).rolling(6).mean()
-    df["aqi_rolling_mean_24h"] = aqi.shift(1).rolling(24).mean()
-    df["aqi_rolling_std_24h"]  = aqi.shift(1).rolling(24).std()
-    df["aqi_rolling_mean_7d"]  = aqi.shift(1).rolling(24 * 7).mean()
+    # Rolling weather features
+    df["temp_rolling_mean_3d"]     = df["temperature"].shift(1).rolling(window=3, min_periods=1).mean()
+    df["humidity_rolling_mean_3d"] = df["humidity"].shift(1).rolling(window=3,    min_periods=1).mean()
 
-    # PM2.5 lags (highest-weight pollutant for AQI in South Asia)
-    if "pm25" in df.columns:
-        for lag_h in [1, 24]:
-            df[f"pm25_lag_{lag_h}h"] = df["pm25"].shift(lag_h)
+    # Targets: AQI 1, 2, 3 days ahead
+    # Train on 1-day-ahead; dashboard chains 3 predictions for 3-day forecast
+    df["target_aqi_1d"] = df["aqi"].shift(-1)
+    df["target_aqi_2d"] = df["aqi"].shift(-2)
+    df["target_aqi_3d"] = df["aqi"].shift(-3)
 
-    # Wind speed lag (dispersion signal)
-    if "wind_speed" in df.columns:
-        df["wind_lag_1h"] = df["wind_speed"].shift(1)
+    # Drop rows with NaN in critical columns
+    required_cols = ["aqi_lag_1d", "aqi_rolling_mean_7d", "target_aqi_1d"]
+    df = df.dropna(subset=required_cols).reset_index(drop=True)
 
-    # Drop rows where lags are undefined (first LOOKBACK_HOURS rows)
-    n_before = len(df)
-    df = df.dropna(subset=[f"aqi_lag_{LOOKBACK_HOURS}h"])
-    log.info(f"  Dropped {n_before - len(df)} rows with undefined lags → {len(df):,} rows remain.")
-
-    return df
-
-
-def build_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Shift AQI forward to create multi-step prediction targets.
-
-    target_24h = AQI 24 hours from now (shift by -24)
-    target_48h = AQI 48 hours from now (shift by -48)
-    target_72h = AQI 72 hours from now (shift by -72)
-
-    Rows near the end of the dataset won't have complete targets → drop them.
-    """
-    log.info("Building prediction targets (future AQI at +24h, +48h, +72h)...")
-    for h in FORECAST_HORIZONS:
-        df[f"target_{h}h"] = df["aqi"].shift(-h)
-
-    # Drop the last FORECAST_HORIZONS[-1] rows (no future data available)
-    df = df.dropna(subset=[f"target_{h}h" for h in FORECAST_HORIZONS])
-    log.info(f"  {len(df):,} rows after dropping incomplete targets.")
+    log.info(f"After lag engineering: {len(df)} rows, {len(df.columns)} features")
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — TRAIN / TEST SPLIT
+# Never use random split for time series — always split by time.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def split_features_targets(df: pd.DataFrame):
-    target_cols  = [f"target_{h}h" for h in FORECAST_HORIZONS]
+def time_based_split(df: pd.DataFrame, test_days: int = TEST_DAYS):
+    """
+    Split DataFrame into train and test sets by time.
+    The last test_days days form the test set.
+    """
+    cutoff = df["timestamp"].max() - pd.Timedelta(days=test_days)
+    train  = df[df["timestamp"] <= cutoff].copy()
+    test   = df[df["timestamp"] >  cutoff].copy()
+    log.info(f"Train: {len(train)} rows ({train['timestamp'].min().date()} to {train['timestamp'].max().date()})")
+    log.info(f"Test:  {len(test)} rows  ({test['timestamp'].min().date()} to {test['timestamp'].max().date()})")
+    return train, test
 
-    # Columns that cause leakage — they are derived directly from AQI
-    # and are perfectly correlated with future AQI targets.
-    # A model using these is not forecasting — it is copying.
-    LEAKY_COLS = [
-        "aqi",
-        "aqi_lag_1h",
-        "aqi_lag_6h",
-        "aqi_lag_24h",
-        "aqi_lag_48h",        # ← add this
-        "aqi_lag_72h",        # ← add this
-        "aqi_rolling_mean_6h",
-        "aqi_rolling_mean_24h",
-        "aqi_rolling_mean_7d",
-        "pm25",
-        "pm25_lag_1h",
-        "pm25_lag_24h",
-    ]
 
-    feature_cols = [
-        c for c in df.columns
-        if c not in target_cols
-        and c != "city"
-        and c not in LEAKY_COLS
-    ]
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Return input feature columns — exclude identity and target columns."""
+    exclude = {
+        "city", "timestamp", "aqi",
+        "target_aqi_1d", "target_aqi_2d", "target_aqi_3d",
+        "weather_desc",
+    }
+    return [c for c in df.columns if c not in exclude]
 
-    X = df[feature_cols].values
-    y = df[target_cols].values
 
-    # Hold out the last TEST_SIZE_DAYS as the test set
-    split_idx = len(df) - TEST_SIZE_DAYS * 24
-    if split_idx < 100:
-        log.warning(
-            f"Dataset is small ({len(df)} rows). Defaulting to 80/20 split."
-        )
-        split_idx = int(len(df) * 0.8)
-
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    log.info(
-        f"  Train: {X_train.shape[0]:,} rows | Test: {X_test.shape[0]:,} rows | "
-        f"Features: {X_train.shape[1]}"
-    )
-    return X_train, X_test, y_train, y_test, feature_cols
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — MODEL TRAINING
+# SECTION 4 — MODEL TRAINING & EVALUATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_ridge(X_train, y_train, X_test, y_test, scaler):
-    """Ridge Regression — strong baseline, interpretable coefficients."""
-    import pandas as pd
-    import numpy as np
+def evaluate_model(model, X_test, y_test, name: str) -> dict:
+    """Compute RMSE, MAE, and R2 for a fitted model."""
+    preds = model.predict(X_test)
+    rmse  = np.sqrt(mean_squared_error(y_test, preds))
+    mae   = mean_absolute_error(y_test, preds)
+    r2    = r2_score(y_test, preds)
+    log.info(f"  {name:30s}  RMSE={rmse:.2f}  MAE={mae:.2f}  R2={r2:.4f}")
+    return {"name": name, "model": model, "rmse": rmse, "mae": mae, "r2": r2, "preds": preds}
 
-    # Step 1: Drop columns that are entirely NaN
-    X_train_df = pd.DataFrame(X_train)
-    X_test_df  = pd.DataFrame(X_test)
 
-    all_nan_cols = X_train_df.columns[X_train_df.isnull().all()]
-    if len(all_nan_cols) > 0:
-        log.info(f"  Dropping {len(all_nan_cols)} fully-NaN columns: {list(all_nan_cols)}")
-        X_train_df = X_train_df.drop(columns=all_nan_cols)
-        X_test_df  = X_test_df.drop(columns=all_nan_cols)
+def train_all_models(X_train, y_train, X_test, y_test) -> list:
+    """
+    Train and evaluate all models.
+    Returns list of result dicts sorted by RMSE ascending.
+    """
+    results = []
 
-    X_train = X_train_df.values
-    X_test  = X_test_df.values
-
-    # Step 2: Impute any remaining NaNs
-    imputer = SimpleImputer(strategy="median")
-    X_train = imputer.fit_transform(X_train)
-    X_test  = imputer.transform(X_test)
-
-    # Step 3: Re-fit scaler on cleaned data (column count may have changed)
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    Xs_train = scaler.fit_transform(X_train)
-    Xs_test  = scaler.transform(X_test)
-
-    # Step 4: Train model
+    # 1. Ridge Regression (linear baseline)
     log.info("Training Ridge Regression...")
-    model = MultiOutputRegressor(Ridge(alpha=1.0, random_state=RANDOM_STATE))
-    model.fit(Xs_train, y_train)
-    preds = model.predict(Xs_test)
-    metrics = evaluate(y_test, preds, "Ridge")
-    return model, metrics, preds
+    ridge = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model",  Ridge(alpha=1.0, random_state=RANDOM_STATE)),
+    ])
+    ridge.fit(X_train, y_train)
+    results.append(evaluate_model(ridge, X_test, y_test, "Ridge Regression"))
 
-
-def train_random_forest(X_train, y_train, X_test, y_test):
-    """Random Forest — captures non-linearity, feature importance for free."""
+    # 2. Random Forest
     log.info("Training Random Forest...")
-    model = RandomForestRegressor(
+    rf = RandomForestRegressor(
         n_estimators=200,
-        max_depth=12,
-        min_samples_leaf=5,
+        max_depth=10,
+        min_samples_leaf=3,
+        random_state=RANDOM_STATE,
         n_jobs=-1,
+    )
+    rf.fit(X_train, y_train)
+    results.append(evaluate_model(rf, X_test, y_test, "Random Forest"))
+
+    # 3. Gradient Boosting
+    log.info("Training Gradient Boosting...")
+    gb = GradientBoostingRegressor(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=4,
+        min_samples_leaf=3,
+        subsample=0.8,
         random_state=RANDOM_STATE,
     )
-    # MultiOutputRegressor wraps RF natively for multi-target output
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
-    metrics = evaluate(y_test, preds, "RandomForest")
-    return model, metrics, preds
+    gb.fit(X_train, y_train)
+    results.append(evaluate_model(gb, X_test, y_test, "Gradient Boosting"))
 
-
-def train_xgboost(X_train, y_train, X_test, y_test):
-    """XGBoost — typically best single-model performance on tabular data."""
-    log.info("Training XGBoost...")
-
-    # XGBoost doesn't natively support multi-output → wrap with sklearn
-    model = MultiOutputRegressor(
-        xgb.XGBRegressor(
-            n_estimators=400,
-            max_depth=6,
+    # 4. XGBoost
+    try:
+        from xgboost import XGBRegressor
+        log.info("Training XGBoost...")
+        xgb = XGBRegressor(
+            n_estimators=200,
             learning_rate=0.05,
+            max_depth=4,
             subsample=0.8,
             colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
             random_state=RANDOM_STATE,
             verbosity=0,
-            n_jobs=-1,
         )
-    )
-    model.fit(X_train, y_train, **{
-        # Pass eval set per-estimator for early stopping awareness
-    })
-    preds = model.predict(X_test)
-    metrics = evaluate(y_test, preds, "XGBoost")
-    return model, metrics, preds
-
-
-def train_lstm(X_train, y_train, X_test, y_test, n_features: int):
-    """
-    LSTM — captures long-range temporal dependencies.
-
-    Architecture rationale:
-    - Input: (batch, LOOKBACK_HOURS=72, n_features) is ideal for LSTM, but
-      the flat tabular format from sklearn means we reshape the lag features
-      into a pseudo-sequence.  We use the last 72 rows of X directly as a
-      sequence by grouping data into overlapping windows of size 72.
-    - Two stacked LSTM layers with dropout prevent overfitting.
-    - Output: 3 neurons (one per forecast horizon), linear activation.
-    """
-    try:
-        import tensorflow as tf
-        from keras.models import Sequential
-        from keras.layers import LSTM, Dense, Dropout
-        from keras.callbacks import EarlyStopping, ReduceLROnPlateau
-        from keras.optimizers import Adam
+        xgb.fit(X_train, y_train)
+        results.append(evaluate_model(xgb, X_test, y_test, "XGBoost"))
     except ImportError:
-        log.warning("TensorFlow not installed. Skipping LSTM.")
-        return None, None, None
+        log.warning("XGBoost not installed. Run: pip install xgboost")
 
-    log.info("Training LSTM...")
-
-    # ── Reshape flat X into (samples, timesteps, features) ───────────────────
-    # We use a sliding window of LOOKBACK_HOURS over the raw data.
-    # X_train rows are already offset correctly (each row is one hourly step),
-    # so we create windows directly from the sequence.
-    SEQ_LEN = min(LOOKBACK_HOURS, X_train.shape[0] // 4)  # safety cap for small datasets
-
-    def make_sequences(X, y, seq_len):
-        Xs, ys = [], []
-        for i in range(seq_len, len(X)):
-            Xs.append(X[i - seq_len:i])
-            ys.append(y[i])
-        return np.array(Xs), np.array(ys)
-
-    Xt_train, yt_train = make_sequences(X_train, y_train, SEQ_LEN)
-    Xt_test,  yt_test  = make_sequences(X_test,  y_test,  SEQ_LEN)
-
-    if len(Xt_train) < 10:
-        log.warning("Not enough data for LSTM sequences after windowing. Skipping.")
-        return None, None, None
-
-    n_timesteps = Xt_train.shape[1]
-    n_feat      = Xt_train.shape[2]
-    n_outputs   = yt_train.shape[1]
-
-    model = Sequential([
-        LSTM(128, input_shape=(n_timesteps, n_feat), return_sequences=True),
-        Dropout(0.2),
-        LSTM(64, return_sequences=False),
-        Dropout(0.2),
-        Dense(32, activation="relu"),
-        Dense(n_outputs, activation="linear"),   # linear for regression
-    ])
-    model.compile(
-        optimizer=Adam(learning_rate=1e-3),
-        loss="mae",
-        metrics=["mae"],
-    )
-
-    callbacks = [
-        EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
-        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6),
-    ]
-
-    model.fit(
-        Xt_train, yt_train,
-        validation_split=0.1,
-        epochs=100,
-        batch_size=32,
-        callbacks=callbacks,
-        verbose=0,
-    )
-
-    preds = model.predict(Xt_test, verbose=0)
-    metrics = evaluate(yt_test, preds, "LSTM")
-
-    # Attach seq_len so the inference pipeline can reconstruct sequences
-    model._seq_len = SEQ_LEN
-    return model, metrics, preds
+    results.sort(key=lambda x: x["rmse"])
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — EVALUATION
+# SECTION 5 — MODEL REGISTRY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(y_true: np.ndarray, y_pred: np.ndarray, name: str) -> dict:
+def register_best_model(project, best: dict, feature_cols: list, metrics: dict):
     """
-    Compute MAE and RMSE per forecast horizon, plus overall mean MAE.
-    Lower is better. MAE is the primary ranking metric (more robust to outliers
-    than RMSE, and directly interpretable as average AQI-point error).
+    Save the best model locally and register it in Hopsworks Model Registry.
     """
-    horizon_metrics = {}
-    maes = []
-    for i, h in enumerate(FORECAST_HORIZONS):
-        mae  = mean_absolute_error(y_true[:, i], y_pred[:, i])
-        rmse = np.sqrt(mean_squared_error(y_true[:, i], y_pred[:, i]))
-        horizon_metrics[f"mae_{h}h"]  = round(mae, 3)
-        horizon_metrics[f"rmse_{h}h"] = round(rmse, 3)
-        maes.append(mae)
+    MODEL_DIR.mkdir(exist_ok=True)
+    model_path    = MODEL_DIR / "best_model.pkl"
+    features_path = MODEL_DIR / "feature_columns.pkl"
 
-    mean_mae = round(float(np.mean(maes)), 3)
-    horizon_metrics["mean_mae"] = mean_mae
+    joblib.dump(best["model"], model_path)
+    joblib.dump(feature_cols, features_path)
+    log.info(f"Model saved locally to {model_path}")
 
-    log.info(
-        f"  [{name}] MAE → 24h: {horizon_metrics['mae_24h']:.2f}  "
-        f"48h: {horizon_metrics['mae_48h']:.2f}  "
-        f"72h: {horizon_metrics['mae_72h']:.2f}  "
-        f"| avg: {mean_mae:.2f}"
-    )
-    return horizon_metrics
-
-
-def pick_best_model(results: dict) -> str:
-    """Return the model name with the lowest mean MAE across horizons."""
-    valid = {k: v for k, v in results.items() if v["metrics"] is not None}
-    best  = min(valid, key=lambda k: valid[k]["metrics"]["mean_mae"])
-    log.info(
-        f"\nBest model: {best} "
-        f"(mean MAE = {valid[best]['metrics']['mean_mae']:.2f})"
-    )
-    return best
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — MODEL REGISTRY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def register_model(
-    project,
-    model_obj,
-    model_name_tag: str,
-    metrics: dict,
-    feature_cols: list,
-    scaler: StandardScaler,
-    is_lstm: bool = False,
-    lstm_seq_len: int = None,
-):
-    """
-    Save model artifacts to a temp dir and push them to the Hopsworks
-    Model Registry.
-
-    Artifacts saved:
-    - model.pkl          sklearn/xgboost model (joblib)    [or]
-    - model.keras        Keras SavedModel format           [LSTM only]
-    - scaler.pkl         StandardScaler fitted on X_train  [Ridge only]
-    - feature_columns.json  ordered list of input features
-    - metrics.json       evaluation results
-    - model_info.json    metadata (type, horizons, seq_len)
-    """
-    import tempfile, shutil
-    tmpdir_path = Path(tempfile.mkdtemp())
-    log.info(f"Saving model artifacts to {tmpdir_path}...")
+    mr = project.get_model_registry()
 
     try:
-        # ── Save model ────────────────────────────────────────────────────────
-        if is_lstm:
-            model_path = tmpdir_path / "model.keras"
-            model_obj.save(str(model_path))
-        else:
-            model_path = tmpdir_path / "model.pkl"
-            joblib.dump(model_obj, model_path)
+        from hsml.schema import Schema
+        from hsml.model_schema import ModelSchema
+        # With this:
+        input_example_df  = pd.DataFrame([dict(zip(feature_cols, [0.0] * len(feature_cols)))])
+        output_example_df = pd.DataFrame([{"aqi_forecast": 0.0}])
+        input_schema  = Schema(input_example_df)
+        output_schema = Schema(output_example_df)
+        model_schema  = ModelSchema(input_schema=input_schema, output_schema=output_schema)
 
-        # ── Save scaler ───────────────────────────────────────────────────────
-        if scaler is not None:
-            joblib.dump(scaler, tmpdir_path / "scaler.pkl")
-
-        # ── Save feature schema ───────────────────────────────────────────────
-        (tmpdir_path / "feature_columns.json").write_text(
-            json.dumps(feature_cols, indent=2)
-        )
-
-        # ── Save metrics ──────────────────────────────────────────────────────
-        (tmpdir_path / "metrics.json").write_text(
-            json.dumps(metrics, indent=2)
-        )
-
-        # ── Save model info ───────────────────────────────────────────────────
-        model_info = {
-            "model_type":       model_name_tag,
-            "forecast_horizons": FORECAST_HORIZONS,
-            "is_lstm":          is_lstm,
-            "lstm_seq_len":     lstm_seq_len,
-            "n_features":       len(feature_cols),
-            "trained_at":       datetime.now(timezone.utc).isoformat(),
-        }
-        (tmpdir_path / "model_info.json").write_text(
-            json.dumps(model_info, indent=2)
-        )
-
-        # ── Push to Hopsworks Model Registry ─────────────────────────────────
-        log.info(f"Registering model '{MODEL_NAME}' to Hopsworks Model Registry...")
-        mr = project.get_model_registry()
-
-        # get_or_create so re-runs don't fail on duplicate names
         hw_model = mr.sklearn.create_model(
-            name=MODEL_NAME,
+            name="aqi_forecaster",
             metrics=metrics,
-            description=(
-                f"AQI 3-day forecaster ({model_name_tag}). "
-                f"Predicts AQI at +24h, +48h, +72h for Islamabad/Rawalpindi. "
-                f"Mean MAE: {metrics['mean_mae']:.2f} AQI points."
-            ),
-            input_example=np.zeros((1, len(feature_cols))).tolist(),
-            model_schema=None,
+            model_schema=model_schema,
+            description=f"Best model: {best['name']} | RMSE={metrics['rmse']:.2f}",
+            input_example=[0.0] * len(feature_cols),
         )
-        hw_model.save(str(tmpdir_path))
-
-        log.info(
-            f"Model registered successfully. "
-            f"Version: {hw_model.version}  |  Artifacts: {list(tmpdir_path.iterdir())}"
-        )
-        return hw_model
-
-    finally:
-        shutil.rmtree(tmpdir_path, ignore_errors=True)
+        hw_model.save(str(MODEL_DIR))
+        log.info("Model registered in Hopsworks Model Registry as 'aqi_forecaster'")
+    except Exception as e:
+        log.warning(f"Could not register in Hopsworks Model Registry: {e}")
+        log.info("Model is still saved locally — inference pipeline will use local file.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — MAIN ORCHESTRATION
+# SECTION 6 — MAIN PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_training(force_model: str = None):
+def run_training_pipeline(lookback_days: int = 7):
     """
-    End-to-end training run.
-
-    Steps:
-    1.  Load features from Hopsworks feature store.
-    2.  Add lag / rolling features.
-    3.  Build multi-step forecast targets.
-    4.  Train / test split (temporal).
-    5.  Fit StandardScaler on training set.
-    6.  Train all four models.
-    7.  Pick the best by mean MAE (or honour --force-model).
-    8.  Register winner to Hopsworks Model Registry.
+    Full training pipeline:
+    1. Fetch features from Hopsworks
+    2. Engineer lag features
+    3. Time-based train/test split
+    4. Train and compare all models
+    5. Register best model in Model Registry
     """
-    # ── 1. Load ───────────────────────────────────────────────────────────────
-    df = load_features_from_store()
 
-    if len(df) < 200:
-        log.error(
-            f"Only {len(df)} rows in the feature store — need at least 200 to train. "
-            "Run backfill.py first."
-        )
-        sys.exit(1)
-
-    # ── 2. Lag features ───────────────────────────────────────────────────────
-    df = add_lag_and_rolling_features(df)
-
-    # ── 3. Targets ────────────────────────────────────────────────────────────
-    df = build_targets(df)
-
-    # ── 4. Split ──────────────────────────────────────────────────────────────
-    X_train, X_test, y_train, y_test, feature_cols = split_features_targets(df)
-
-    # ── 5. Scale (fit only on train to prevent leakage) ───────────────────────
-    scaler = StandardScaler()
-    scaler.fit(X_train)
-
-    # ── 5. Scale (fit only on train to prevent leakage) ───────────────────────
-    scaler = StandardScaler()
-    scaler.fit(X_train)
-
-    # ── 6. Train all models ───────────────────────────────────────────────────
-    results = {}
-
-    ridge_model, ridge_metrics, _ = train_ridge(X_train, y_train, X_test, y_test, scaler)
-    results["ridge"] = {"model": ridge_model, "metrics": ridge_metrics, "scaler": scaler, "is_lstm": False}
-
-    rf_model, rf_metrics, _ = train_random_forest(X_train, y_train, X_test, y_test)
-    results["random_forest"] = {"model": rf_model, "metrics": rf_metrics, "scaler": None, "is_lstm": False}
-
-    xgb_model, xgb_metrics, _ = train_xgboost(X_train, y_train, X_test, y_test)
-    results["xgboost"] = {"model": xgb_model, "metrics": xgb_metrics, "scaler": None, "is_lstm": False}
-
-    lstm_model, lstm_metrics, _ = train_lstm(X_train, y_train, X_test, y_test, n_features=X_train.shape[1])
-    if lstm_model is not None:
-        results["lstm"] = {
-            "model": lstm_model,
-            "metrics": lstm_metrics,
-            "scaler": None,
-            "is_lstm": True,
-            "seq_len": getattr(lstm_model, "_seq_len", LOOKBACK_HOURS),
-        }
-
-    # ── 7. Pick winner ────────────────────────────────────────────────────────
-    if force_model:
-        if force_model not in results:
-            log.error(f"--force-model '{force_model}' is not in {list(results.keys())}")
-            sys.exit(1)
-        best_name = force_model
-        log.info(f"Forcing model selection: {best_name}")
-    else:
-        best_name = pick_best_model(results)
-
-    best = results[best_name]
-
-    # Print a summary comparison table
-    log.info("\n── Model comparison ──────────────────────────────────────────────")
-    log.info(f"{'Model':<16} {'MAE 24h':>8} {'MAE 48h':>8} {'MAE 72h':>8} {'Avg MAE':>8}")
-    log.info("─" * 55)
-    for name, r in results.items():
-        m = r["metrics"]
-        if m:
-            marker = "  ← best" if name == best_name else ""
-            log.info(
-                f"{name:<16} {m['mae_24h']:>8.2f} {m['mae_48h']:>8.2f} "
-                f"{m['mae_72h']:>8.2f} {m['mean_mae']:>8.2f}{marker}"
-            )
-    log.info("─" * 55)
-
-    # ── 8. Register winner ────────────────────────────────────────────────────
+    # Connect to Hopsworks
+    log.info("Connecting to Hopsworks...")
     project = hopsworks.login(
         api_key_value=HOPSWORKS_API_KEY,
         project=HOPSWORKS_PROJECT,
     )
 
-    seq_len = best.get("seq_len") if best["is_lstm"] else None
+    # Fetch and prepare data
+    df = fetch_features(project)
 
-    register_model(
-        project=project,
-        model_obj=best["model"],
-        model_name_tag=best_name,
-        metrics=best["metrics"],
-        feature_cols=feature_cols,
-        scaler=best.get("scaler"),
-        is_lstm=best["is_lstm"],
-        lstm_seq_len=seq_len,
-    )
+    if len(df) < 50:
+        log.error(f"Not enough data to train ({len(df)} rows). Run backfill first.")
+        sys.exit(1)
 
-    log.info("\nPhase 3 complete. Model registered to Hopsworks Model Registry.")
-    log.info("Next: build pipelines/inference_pipeline.py (Phase 4).")
+    df = engineer_lag_features(df, lookback_days=lookback_days)
 
-    return results, best_name
+    # Split
+    train_df, test_df = time_based_split(df)
+    feature_cols = get_feature_columns(df)
+    target_col   = "target_aqi_1d"
+
+    # Impute NaN values with column median before training
+    # NaNs come from missing pollutants (pm10, no2, o3, so2, co)
+    imputer = SimpleImputer(strategy="median")
+
+    X_train = imputer.fit_transform(train_df[feature_cols])
+    X_test  = imputer.transform(test_df[feature_cols])
+    y_train = train_df[target_col].values
+    y_test  = test_df[target_col].values
+
+    # Save imputer alongside model for use in inference
+    joblib.dump(imputer, MODEL_DIR / "imputer.pkl")
+
+    log.info(f"Features: {len(feature_cols)} columns")
+    log.info(f"Training on {len(X_train)} rows, evaluating on {len(X_test)} rows")
+
+    # Train all models
+    log.info("\n── Model Comparison ─────────────────────────────────")
+    results = train_all_models(X_train, y_train, X_test, y_test)
+
+    # Print final rankings
+    log.info("\n── Final Rankings ───────────────────────────────────")
+    log.info(f"{'Rank':<6}{'Model':<30}{'RMSE':>8}{'MAE':>8}{'R2':>8}")
+    log.info("-" * 62)
+    for i, r in enumerate(results, 1):
+        log.info(f"{i:<6}{r['name']:<30}{r['rmse']:>8.2f}{r['mae']:>8.2f}{r['r2']:>8.4f}")
+
+    best = results[0]
+    log.info(f"\nBest model: {best['name']} (RMSE={best['rmse']:.2f})")
+
+    # Register best model
+    metrics = {
+        "rmse": round(best["rmse"], 4),
+        "mae":  round(best["mae"],  4),
+        "r2":   round(best["r2"],   4),
+    }
+    register_best_model(project, best, feature_cols, metrics)
+
+    log.info("\nTraining pipeline complete.")
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -660,11 +355,15 @@ def run_training(force_model: str = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AQI Training Pipeline")
     parser.add_argument(
-        "--force-model",
-        type=str,
-        choices=["ridge", "random_forest", "xgboost", "lstm"],
-        default=None,
-        help="Force a specific model to be registered, ignoring metric ranking.",
+        "--lookback", type=int, default=7,
+        help="Number of past days for lag features (default: 7)"
     )
     args = parser.parse_args()
-    run_training(force_model=args.force_model)
+
+    try:
+        import xgboost
+    except ImportError:
+        log.info("Installing xgboost...")
+        os.system(f"{sys.executable} -m pip install xgboost")
+
+    run_training_pipeline(lookback_days=args.lookback)
