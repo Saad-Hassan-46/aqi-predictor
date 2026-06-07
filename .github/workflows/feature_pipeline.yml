@@ -36,8 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install confluent-kafka==2.3.0
-          pip install "hopsworks[python]==4.7.*"
+          pip install hopsworks==4.7.6
           pip install -r requirements.txt
 
       # ── 4. Run feature pipeline ────────────────────────────────────────────

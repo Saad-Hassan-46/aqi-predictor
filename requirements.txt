@@ -5,7 +5,7 @@ requests>=2.31
 python-dotenv>=1.0
 
 # Feature store
-hopsworks>=3.7
+hopsworks==4.7.6
 
 # ML
 scikit-learn>=1.4
