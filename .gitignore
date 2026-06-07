@@ -1,8 +1,11 @@
 # Secrets
 .env
 *.env
+<<<<<<< HEAD
 API.txt
 app/secrets.toml
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 # Python
 __pycache__/
@@ -16,7 +19,10 @@ build/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+<<<<<<< HEAD
 notebooks/*.ipynb
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 # Data (large files go in Hopsworks, not git)
 data/*.csv
@@ -31,4 +37,8 @@ models/*.keras
 
 # OS
 .DS_Store
+<<<<<<< HEAD
 Thumbs.db
+=======
+Thumbs.db
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9

@@ -31,11 +31,14 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 
+<<<<<<< HEAD
 try:
     from pipelines.feature_engineering import add_daily_lag_features
 except ModuleNotFoundError:
     from feature_engineering import add_daily_lag_features
 
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 warnings.filterwarnings("ignore")
 
 # ── Load environment ──────────────────────────────────────────────────────────
@@ -99,7 +102,37 @@ def engineer_lag_features(df: pd.DataFrame, lookback_days: int = 7) -> pd.DataFr
         DataFrame with lag features added, NaN rows dropped
     """
     log.info(f"Engineering lag features (lookback={lookback_days} days)...")
+<<<<<<< HEAD
     df = add_daily_lag_features(df, lookback_days=lookback_days)
+=======
+    df = df.copy()
+
+    # Lag features: AQI values from past N days
+    for lag in [1, 2, 3, 7, 14]:
+        if lag <= lookback_days:
+            df[f"aqi_lag_{lag}d"] = df["aqi"].shift(lag)
+
+    # Rolling statistics
+    df["aqi_rolling_mean_3d"]  = df["aqi"].shift(1).rolling(window=3,  min_periods=1).mean()
+    df["aqi_rolling_mean_7d"]  = df["aqi"].shift(1).rolling(window=7,  min_periods=1).mean()
+    df["aqi_rolling_mean_14d"] = df["aqi"].shift(1).rolling(window=14, min_periods=1).mean()
+    df["aqi_rolling_std_7d"]   = df["aqi"].shift(1).rolling(window=7,  min_periods=2).std().fillna(0)
+
+    # Rolling weather features
+    df["temp_rolling_mean_3d"]     = df["temperature"].shift(1).rolling(window=3, min_periods=1).mean()
+    df["humidity_rolling_mean_3d"] = df["humidity"].shift(1).rolling(window=3,    min_periods=1).mean()
+
+    # Targets: AQI 1, 2, 3 days ahead
+    # Train on 1-day-ahead; dashboard chains 3 predictions for 3-day forecast
+    df["target_aqi_1d"] = df["aqi"].shift(-1)
+    df["target_aqi_2d"] = df["aqi"].shift(-2)
+    df["target_aqi_3d"] = df["aqi"].shift(-3)
+
+    # Drop rows with NaN in critical columns
+    required_cols = ["aqi_lag_1d", "aqi_rolling_mean_7d", "target_aqi_1d"]
+    df = df.dropna(subset=required_cols).reset_index(drop=True)
+
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     log.info(f"After lag engineering: {len(df)} rows, {len(df.columns)} features")
     return df
 
@@ -295,7 +328,10 @@ def run_training_pipeline(lookback_days: int = 7):
     y_train = train_df[target_col].values
     y_test  = test_df[target_col].values
 
+<<<<<<< HEAD
     MODEL_DIR.mkdir(exist_ok=True)
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     # Save imputer alongside model for use in inference
     joblib.dump(imputer, MODEL_DIR / "imputer.pkl")
 
@@ -346,4 +382,8 @@ if __name__ == "__main__":
         log.info("Installing xgboost...")
         os.system(f"{sys.executable} -m pip install xgboost")
 
+<<<<<<< HEAD
     run_training_pipeline(lookback_days=args.lookback)
+=======
+    run_training_pipeline(lookback_days=args.lookback)
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9

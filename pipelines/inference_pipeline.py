@@ -105,7 +105,11 @@ def load_model(project):
     # get_best_model fetches the version with the best metric
     # Falls back to latest version if metric not found
     try:
+<<<<<<< HEAD
         hw_model = mr.get_model(name=MODEL_NAME)
+=======
+        hw_model = mr.get_model(name=MODEL_NAME)  # defaults to latest version
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     except Exception:
         log.warning("Could not fetch best model by metric — loading latest version.")
         hw_model = mr.get_model(name=MODEL_NAME)

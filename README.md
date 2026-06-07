@@ -6,7 +6,11 @@ A 3-day Air Quality Index forecasting system using a 100% serverless ML stack.
 [Streamlit App](https://your-app-url.streamlit.app) <!-- update after deployment -->
 
 ## Architecture
+<<<<<<< HEAD
 Raw API data -> Feature Pipeline -> Hopsworks Feature Store -> Training Pipeline -> Model Registry -> Streamlit Dashboard
+=======
+Raw API data → Feature Pipeline → Hopsworks Feature Store → Training Pipeline → Model Registry → Streamlit Dashboard
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 ## Stack
 - **Data**: AQICN API / OpenWeather API
@@ -25,8 +29,11 @@ pip install -r requirements.txt
 cp .env.example .env   # then fill in your API keys
 ```
 
+<<<<<<< HEAD
 On Windows, if `python` opens the Microsoft Store, install Python 3.11 from python.org or fix App Execution Aliases, then rerun the setup commands.
 
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 ## Run pipelines locally
 ```bash
 python pipelines/feature_pipeline.py     # fetch + engineer features
@@ -35,6 +42,7 @@ python pipelines/training_pipeline.py    # train and register model
 streamlit run app/app.py                 # launch dashboard
 ```
 
+<<<<<<< HEAD
 ## Validate locally
 ```bash
 python -m pytest -q
@@ -50,3 +58,7 @@ See `docs/ROADMAP.md`
 
 ## Learning resources
 See `docs/LEARNING_RESOURCES.md`
+=======
+## Project structure
+See `docs/architecture.md`
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9

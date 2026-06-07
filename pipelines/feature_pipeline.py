@@ -32,9 +32,15 @@ tmpdir = os.getenv("HOPSWORKS_TMPDIR")
 if tmpdir:
     tempfile.tempdir = tmpdir
 
+<<<<<<< HEAD
 AQICN_API_KEY       = os.getenv("AQICN_API_KEY")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 HOPSWORKS_API_KEY   = os.getenv("HOPSWORKS_API_KEY")
+=======
+AQICN_API_KEY       = os.getenv("56902632900ff5599183fbded99acd3dffd62219")
+OPENWEATHER_API_KEY = os.getenv("37b7a3ab54ab4b514cf7d81efc0fd411")
+HOPSWORKS_API_KEY   = os.getenv("PDNDYtjehc4whxLP.0HAPAs4ZShvlnuUeyJmSuw4xwPBN3pfwCdhqVYaKspUMdwHlUg0NopCBRNclB6au")
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 HOPSWORKS_PROJECT   = os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model")
 CITY_NAME           = os.getenv("CITY_NAME", "Rawalpindi")
 CITY_LAT            = float(os.getenv("CITY_LAT", 33.5651))
@@ -54,9 +60,13 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_aqi_data(city: str = None) -> dict:
+<<<<<<< HEAD
     key = AQICN_API_KEY
     if not key:
         raise RuntimeError("AQICN_API_KEY is missing. Add it to .env or GitHub Actions secrets.")
+=======
+    key = os.getenv("AQICN_API_KEY")
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     if city is None:
         city = os.getenv("CITY_NAME", "islamabad")
     url = f"https://api.waqi.info/feed/{city}/?token={key}"
@@ -81,9 +91,13 @@ def fetch_aqi_data(city: str = None) -> dict:
 
 
 def fetch_weather_data(lat: float = None, lon: float = None) -> dict:
+<<<<<<< HEAD
     key = OPENWEATHER_API_KEY
     if not key:
         raise RuntimeError("OPENWEATHER_API_KEY is missing. Add it to .env or GitHub Actions secrets.")
+=======
+    key = os.getenv("OPENWEATHER_API_KEY")
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     if lat is None: lat = float(os.getenv("CITY_LAT", 33.7235))
     if lon is None: lon = float(os.getenv("CITY_LON", 73.11822))
     url = (
@@ -199,6 +213,7 @@ def get_or_create_feature_group(fs):
     re-run the pipeline for the same timestamp, it updates rather
     than duplicates the row (upsert behaviour).
     """
+<<<<<<< HEAD
     return fs.get_or_create_feature_group(
         name="aqi_features",
         version=1,
@@ -207,6 +222,16 @@ def get_or_create_feature_group(fs):
         event_time="timestamp",
         online_enabled=False,
     )
+=======
+    feature_group = fs.get_or_create_feature_group(
+    name="aqi_features",
+    version=1,
+    description="Hourly AQI and weather features for Islamabad",
+    primary_key=["city", "timestamp"],
+    event_time="timestamp",
+    online_enabled=False,   # Changed from True
+)
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 
 def fetch_previous_aqi_from_store(fs, city: str) -> float:
@@ -262,8 +287,11 @@ def run_pipeline(target_date: datetime = None) -> pd.DataFrame:
 
     # ── 3. Connect to Hopsworks ───────────────────────────────────────────────
     log.info("Connecting to Hopsworks feature store...")
+<<<<<<< HEAD
     if not HOPSWORKS_API_KEY:
         raise RuntimeError("HOPSWORKS_API_KEY is missing. Add it to .env or GitHub Actions secrets.")
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     project = hopsworks.login(
         api_key_value=HOPSWORKS_API_KEY,
         project=HOPSWORKS_PROJECT,

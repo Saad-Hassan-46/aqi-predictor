@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 import os
 import hopsworks
 
+<<<<<<< HEAD
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 api_key = os.getenv("HOPSWORKS_API_KEY")
@@ -14,6 +15,13 @@ if not api_key:
 project = hopsworks.login(
     api_key_value=api_key,
     project=project_name,
+=======
+load_dotenv(dotenv_path=Path(r"D:\Internship Project\aqi-predictor") / ".env")
+
+project = hopsworks.login(
+    api_key_value=os.getenv("PDNDYtjehc4whxLP.0HAPAs4ZShvlnuUeyJmSuw4xwPBN3pfwCdhqVYaKspUMdwHlUg0NopCBRNclB6au"),
+    project=os.getenv("aqi_predictor_model")
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 )
 
 fs = project.get_feature_store()
@@ -32,4 +40,8 @@ print(
     df[["timestamp", "aqi", "pm25", "temperature"]]
     .sort_values("timestamp")
     .head(10)
+<<<<<<< HEAD
 )
+=======
+)
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9

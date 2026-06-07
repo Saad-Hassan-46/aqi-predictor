@@ -14,6 +14,10 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+<<<<<<< HEAD
+=======
+import hopsworks
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,11 +26,14 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+<<<<<<< HEAD
 try:
     import hopsworks
 except ImportError:
     hopsworks = None
 
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 warnings.filterwarnings("ignore")
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
@@ -38,8 +45,12 @@ st.set_page_config(
 )
 
 # ── Load environment ──────────────────────────────────────────────────────────
+<<<<<<< HEAD
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+=======
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model")
@@ -68,10 +79,13 @@ def get_aqi_category(aqi: float) -> dict:
 @st.cache_resource(ttl=3600, show_spinner="Connecting to Hopsworks...")
 def load_hopsworks():
     """Connect to Hopsworks and return project object. Cached for 1 hour."""
+<<<<<<< HEAD
     if hopsworks is None:
         raise RuntimeError("hopsworks is not installed.")
     if not HOPSWORKS_API_KEY:
         raise RuntimeError("HOPSWORKS_API_KEY is not configured.")
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
     project = hopsworks.login(
         api_key_value=HOPSWORKS_API_KEY,
         project=HOPSWORKS_PROJECT,
@@ -82,6 +96,7 @@ def load_hopsworks():
 @st.cache_data(ttl=3600, show_spinner="Loading features from feature store...")
 def load_features():
     """Load and return the latest features from Hopsworks."""
+<<<<<<< HEAD
     try:
         project = load_hopsworks()
         fs      = project.get_feature_store()
@@ -91,11 +106,20 @@ def load_features():
         return df
     except Exception:
         return load_local_features()
+=======
+    project = load_hopsworks()
+    fs      = project.get_feature_store()
+    fg      = fs.get_feature_group("aqi_features", version=1)
+    df      = fg.read()
+    df      = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
 
 @st.cache_resource(ttl=86400, show_spinner="Loading model from registry...")
 def load_model():
     """Load best model, imputer, and feature columns from Hopsworks Model Registry."""
+<<<<<<< HEAD
     try:
         project = load_hopsworks()
         mr      = project.get_model_registry()
@@ -105,6 +129,14 @@ def load_model():
         model_dir  = Path(model_meta.download())
     except Exception:
         model_dir = PROJECT_ROOT / "models"
+=======
+    project = load_hopsworks()
+    mr      = project.get_model_registry()
+
+    # Get latest version of the model
+    model_meta = mr.get_best_model("aqi_forecaster", metric="rmse", direction="min")
+    model_dir  = Path(model_meta.download())
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 
     model        = joblib.load(model_dir / "best_model.pkl")
     feature_cols = joblib.load(model_dir / "feature_columns.pkl")
@@ -113,6 +145,7 @@ def load_model():
     return model, feature_cols, imputer
 
 
+<<<<<<< HEAD
 def pm25_to_aqi(pm25: float) -> float:
     breakpoints = [
         (0.0, 12.0, 0, 50),
@@ -160,6 +193,8 @@ def load_local_features():
     return df
 
 
+=======
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE ENGINEERING — same functions as training pipeline
 # ══════════════════════════════════════════════════════════════════════════════
@@ -210,10 +245,15 @@ def generate_3day_forecast(df, model, feature_cols, imputer) -> list:
 
         # Update lag features for next iteration
         latest = latest.copy()
+<<<<<<< HEAD
         prev_lag_1d = latest["aqi_lag_1d"].copy()
         prev_lag_2d = latest["aqi_lag_2d"].copy()
         latest["aqi_lag_2d"]           = prev_lag_1d
         latest["aqi_lag_3d"]           = prev_lag_2d
+=======
+        latest["aqi_lag_2d"]           = latest["aqi_lag_1d"]
+        latest["aqi_lag_3d"]           = latest["aqi_lag_2d"]
+>>>>>>> 4d870c6d4d159ff80ae0af65d9693268a6743cd9
         latest["aqi_lag_7d"]           = latest["aqi_lag_7d"]
         latest["aqi_lag_1d"]           = pred_aqi
         latest["aqi_rolling_mean_3d"]  = (latest["aqi_rolling_mean_3d"] * 2 + pred_aqi) / 3
