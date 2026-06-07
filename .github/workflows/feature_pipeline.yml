@@ -1,0 +1,62 @@
+# .github/workflows/feature_pipeline.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs the feature pipeline every hour to fetch live AQI + weather data
+# and push it to the Hopsworks feature store.
+#
+# Also runs on every push to main (for testing) and can be triggered manually.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Feature Pipeline (Hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour at :00
+  push:
+    branches: [main]       # also run on push to main for testing
+  workflow_dispatch:       # allow manual trigger from GitHub UI
+
+jobs:
+  run-feature-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15    # kill if it hangs
+
+    steps:
+      # ── 1. Checkout code ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"           # cache pip downloads for faster runs
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run feature pipeline ────────────────────────────────────────────
+      # Secrets are injected as environment variables from GitHub Secrets.
+      # Never hardcode API keys in YAML files.
+      - name: Run feature pipeline
+        env:
+          AQICN_API_KEY:        ${{ secrets.AQICN_API_KEY }}
+          OPENWEATHER_API_KEY:  ${{ secrets.OPENWEATHER_API_KEY }}
+          HOPSWORKS_API_KEY:    ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+          CITY_NAME:            islamabad
+          CITY_LAT:             "33.7235"
+          CITY_LON:             "73.11822"
+        run: python pipelines/feature_pipeline.py
+
+      # ── 5. Notify on failure (optional but professional) ──────────────────
+      - name: Report status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "Feature pipeline completed successfully at $(date -u)"
+          else
+            echo "Feature pipeline FAILED at $(date -u)"
+            exit 1
+          fi
