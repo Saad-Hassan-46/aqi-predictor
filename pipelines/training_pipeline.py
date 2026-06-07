@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MODEL_DIR    = Path(__file__).resolve().parent.parent / "models"
-TEST_DAYS    = 30
+TEST_DAYS    = 365
 RANDOM_STATE = 42
 
 
