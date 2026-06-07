@@ -336,7 +336,7 @@ def run_pipeline(target_date: datetime = None) -> pd.DataFrame:
 
     # ── 8. Push to feature store ──────────────────────────────────────────────
     fg = get_or_create_feature_group(fs)
-    fg.insert(df, write_options={"wait_for_job": False})
+    fg.insert(df, write_options={"wait_for_job": False, "use_kafka": False})
     log.info(f"Successfully pushed 1 row to feature group 'aqi_features'.")
 
     return df

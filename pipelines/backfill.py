@@ -372,7 +372,7 @@ def run_backfill(start_date: datetime, end_date: datetime, dry_run: bool = False
                     if col in df_batch.columns:
                         df_batch[col] = df_batch[col].astype('float64')
 
-                fg.insert(df_batch, write_options={"wait_for_job": False})
+                fg.insert(df_batch, write_options={"wait_for_job": False, "use_kafka": False})
                 log.info(f"  Batch of {len(rows_batch)} rows pushed to feature store")
                 rows_batch = []
                 save_checkpoint(processed)

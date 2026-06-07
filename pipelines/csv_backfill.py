@@ -204,7 +204,7 @@ def push_to_hopsworks(df: pd.DataFrame):
 
     for start in range(0, total, batch_size):
         batch = df.iloc[start:start + batch_size]
-        fg.insert(batch, write_options={"wait_for_job": False})
+        fg.insert(batch, write_options={"wait_for_job": False, "use_kafka": False})
         pushed += len(batch)
         log.info(f"Pushed {pushed}/{total} rows...")
 
