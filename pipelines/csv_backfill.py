@@ -189,13 +189,13 @@ def push_to_hopsworks(df: pd.DataFrame):
     )
     fs = project.get_feature_store()
     fg = fs.get_or_create_feature_group(
-        name="aqi_features",
-        version=1,
-        description="Hourly AQI and weather features for Islamabad",
-        primary_key=["city", "timestamp"],
-        event_time="timestamp",
-        online_enabled=True,
-    )
+    name="aqi_features",
+    version=1,
+    description="Hourly AQI and weather features for Islamabad",
+    primary_key=["city", "timestamp"],
+    event_time="timestamp",
+    online_enabled=False,   # Changed from True
+)
 
     # Push in batches of 100
     batch_size = 100

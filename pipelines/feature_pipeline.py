@@ -196,14 +196,13 @@ def get_or_create_feature_group(fs):
     than duplicates the row (upsert behaviour).
     """
     feature_group = fs.get_or_create_feature_group(
-        name="aqi_features",
-        version=1,
-        description="Hourly AQI and weather features for Rawalpindi",
-        primary_key=["city", "timestamp"],
-        event_time="timestamp",
-        online_enabled=True,   # enables real-time serving for the dashboard
-    )
-    return feature_group
+    name="aqi_features",
+    version=1,
+    description="Hourly AQI and weather features for Islamabad",
+    primary_key=["city", "timestamp"],
+    event_time="timestamp",
+    online_enabled=False,   # Changed from True
+)
 
 
 def fetch_previous_aqi_from_store(fs, city: str) -> float:
