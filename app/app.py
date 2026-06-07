@@ -1,660 +1,566 @@
 """
 app.py
--------
-Main Streamlit application for the AQI Forecaster.
+------
+AQI Forecasting Dashboard — Islamabad
+Loads model and features from Hopsworks, generates 3-day AQI forecast,
+shows pollutant breakdown, SHAP explainability, and hazard alerts.
 
-Pages:
-  1. Forecast        — AQI predictions at +24h, +48h, +72h
-  2. Historical      — Historical AQI trend chart
-  3. Explainability  — SHAP feature importance
-  4. About           — Project info and architecture
-
-Run locally:
+Deploy:
     streamlit run app/app.py
-
-Deployed on Streamlit Community Cloud.
 """
 
-import json
-import sys
-from datetime import datetime, timezone
+import os
+import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import hopsworks
+import joblib
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
 
-# ── Path setup ────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+warnings.filterwarnings("ignore")
 
-from config.aqi_categories import AQI_CATEGORIES, get_aqi_category
-
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
-    page_title="AQI Forecaster — Rawalpindi",
-    page_icon="🌬️",
+    page_title="Islamabad AQI Forecast",
+    page_icon="🌫️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Minimal custom CSS ────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .metric-card {
-        background: #f8f9fa;
-        border-radius: 12px;
-        padding: 20px 24px;
-        border-left: 5px solid #ccc;
-        margin-bottom: 8px;
-    }
-    .metric-label { font-size: 13px; color: #666; font-weight: 500; margin-bottom: 4px; }
-    .metric-value { font-size: 36px; font-weight: 700; color: #111; }
-    .metric-category { font-size: 14px; font-weight: 600; margin-top: 4px; }
-    .metric-advice { font-size: 12px; color: #555; margin-top: 6px; }
-    .section-header { font-size: 20px; font-weight: 600; color: #111; margin: 24px 0 12px 0; }
-    .stAlert { border-radius: 8px; }
-    div[data-testid="stSidebarNav"] { display: none; }
-</style>
-""", unsafe_allow_html=True)
+# ── Load environment ──────────────────────────────────────────────────────────
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+
+HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
+HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model")
+
+# ── AQI Category definitions ──────────────────────────────────────────────────
+AQI_CATEGORIES = [
+    {"label": "Good",           "min": 0,   "max": 50,  "color": "#00C853", "bg": "#E8F5E9", "emoji": "😊"},
+    {"label": "Moderate",       "min": 51,  "max": 100, "color": "#FFD600", "bg": "#FFFDE7", "emoji": "😐"},
+    {"label": "Unhealthy (SG)", "min": 101, "max": 150, "color": "#FF6D00", "bg": "#FFF3E0", "emoji": "😷"},
+    {"label": "Unhealthy",      "min": 151, "max": 200, "color": "#D50000", "bg": "#FFEBEE", "emoji": "🤢"},
+    {"label": "Very Unhealthy", "min": 201, "max": 300, "color": "#6A1B9A", "bg": "#F3E5F5", "emoji": "🚨"},
+    {"label": "Hazardous",      "min": 301, "max": 500, "color": "#37474F", "bg": "#ECEFF1", "emoji": "☠️"},
+]
+
+def get_aqi_category(aqi: float) -> dict:
+    for cat in AQI_CATEGORIES:
+        if cat["min"] <= aqi <= cat["max"]:
+            return cat
+    return AQI_CATEGORIES[-1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADING HELPERS
+# DATA LOADING — cached so it doesn't reload on every interaction
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_predictions() -> dict | None:
+@st.cache_resource(ttl=3600, show_spinner="Connecting to Hopsworks...")
+def load_hopsworks():
+    """Connect to Hopsworks and return project object. Cached for 1 hour."""
+    project = hopsworks.login(
+        api_key_value=HOPSWORKS_API_KEY,
+        project=HOPSWORKS_PROJECT,
+    )
+    return project
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading features from feature store...")
+def load_features():
+    """Load and return the latest features from Hopsworks."""
+    project = load_hopsworks()
+    fs      = project.get_feature_store()
+    fg      = fs.get_feature_group("aqi_features", version=1)
+    df      = fg.read()
+    df      = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+@st.cache_resource(ttl=86400, show_spinner="Loading model from registry...")
+def load_model():
+    """Load best model, imputer, and feature columns from Hopsworks Model Registry."""
+    project = load_hopsworks()
+    mr      = project.get_model_registry()
+
+    # Get latest version of the model
+    model_meta = mr.get_best_model("aqi_forecaster", metric="rmse", direction="min")
+    model_dir  = Path(model_meta.download())
+
+    model        = joblib.load(model_dir / "best_model.pkl")
+    feature_cols = joblib.load(model_dir / "feature_columns.pkl")
+    imputer      = joblib.load(model_dir / "imputer.pkl")
+
+    return model, feature_cols, imputer
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE ENGINEERING — same functions as training pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def engineer_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add lag and rolling features — must match training pipeline exactly."""
+    df = df.copy().sort_values("timestamp").reset_index(drop=True)
+    for lag in [1, 2, 3, 7, 14]:
+        df[f"aqi_lag_{lag}d"] = df["aqi"].shift(lag)
+    df["aqi_rolling_mean_3d"]      = df["aqi"].shift(1).rolling(3,  min_periods=1).mean()
+    df["aqi_rolling_mean_7d"]      = df["aqi"].shift(1).rolling(7,  min_periods=1).mean()
+    df["aqi_rolling_mean_14d"]     = df["aqi"].shift(1).rolling(14, min_periods=1).mean()
+    df["aqi_rolling_std_7d"]       = df["aqi"].shift(1).rolling(7,  min_periods=2).std().fillna(0)
+    df["temp_rolling_mean_3d"]     = df["temperature"].shift(1).rolling(3, min_periods=1).mean()
+    df["humidity_rolling_mean_3d"] = df["humidity"].shift(1).rolling(3,    min_periods=1).mean()
+    df["target_aqi_1d"]            = df["aqi"].shift(-1)
+    df["target_aqi_2d"]            = df["aqi"].shift(-2)
+    df["target_aqi_3d"]            = df["aqi"].shift(-3)
+    return df
+
+
+def generate_3day_forecast(df, model, feature_cols, imputer) -> list:
     """
-    Load latest predictions. Tries Hopsworks first, falls back to local JSON.
-    Returns None if neither source is available.
+    Generate 3-day AQI forecast using recursive prediction.
+    Day 1 prediction feeds into Day 2 features, and so on.
     """
-    # ── Try local backup first (fast, no network) ─────────────────────────────
-    local_path = ROOT / "data" / "latest_predictions.json"
-    if local_path.exists():
-        try:
-            data = json.loads(local_path.read_text())
-            data["_source"] = "local"
-            return data
-        except Exception:
-            pass
+    df_feat  = engineer_lag_features(df)
+    latest   = df_feat.iloc[-1:].copy()
+    forecasts = []
 
-    # ── Try Hopsworks ─────────────────────────────────────────────────────────
-    try:
-        import os
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=ROOT / ".env")
+    exclude = {"city", "timestamp", "aqi", "target_aqi_1d",
+               "target_aqi_2d", "target_aqi_3d", "weather_desc"}
+    feat_cols = [c for c in feature_cols if c in latest.columns]
 
-        import hopsworks
-        project = hopsworks.login(
-            api_key_value=os.getenv("HOPSWORKS_API_KEY"),
-            project=os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model"),
-        )
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group("aqi_predictions", version=1)
-        df = fg.read()
-        if len(df) == 0:
-            return None
+    for day in range(1, 4):
+        X = latest[feat_cols].values
+        X = imputer.transform(X)
+        pred_aqi = float(model.predict(X)[0])
+        pred_aqi = max(0, min(500, pred_aqi))  # clip to valid range
 
-        df["predicted_at"] = pd.to_datetime(df["predicted_at"], utc=True)
-        latest = df.sort_values("predicted_at").iloc[-1]
+        forecast_date = datetime.now(timezone.utc) + timedelta(days=day)
+        forecasts.append({
+            "day":   day,
+            "date":  forecast_date.strftime("%A, %b %d"),
+            "aqi":   round(pred_aqi, 1),
+            "cat":   get_aqi_category(pred_aqi),
+        })
 
-        return {
-            "generated_at": str(latest["predicted_at"]),
-            "based_on_data_at": str(latest["timestamp"]),
-            "predictions": {
-                "aqi_pred_24h": float(latest["aqi_pred_24h"]),
-                "aqi_pred_48h": float(latest["aqi_pred_48h"]),
-                "aqi_pred_72h": float(latest["aqi_pred_72h"]),
-            },
-            "horizons_hours": [24, 48, 72],
-            "_source": "hopsworks",
-        }
-    except Exception:
-        return None
+        # Update lag features for next iteration
+        latest = latest.copy()
+        latest["aqi_lag_2d"]           = latest["aqi_lag_1d"]
+        latest["aqi_lag_3d"]           = latest["aqi_lag_2d"]
+        latest["aqi_lag_7d"]           = latest["aqi_lag_7d"]
+        latest["aqi_lag_1d"]           = pred_aqi
+        latest["aqi_rolling_mean_3d"]  = (latest["aqi_rolling_mean_3d"] * 2 + pred_aqi) / 3
+        latest["aqi_rolling_mean_7d"]  = (latest["aqi_rolling_mean_7d"] * 6 + pred_aqi) / 7
+        latest["aqi_change_rate"]      = round((pred_aqi - float(latest["aqi"].iloc[0])) / max(float(latest["aqi"].iloc[0]), 1) * 100, 4)
+        latest["aqi"]                  = pred_aqi
 
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_historical() -> pd.DataFrame | None:
-    """
-    Load historical AQI data from Hopsworks feature store.
-    Falls back to None if unavailable.
-    """
-    try:
-        import os
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=ROOT / ".env")
-
-        import hopsworks
-        project = hopsworks.login(
-            api_key_value=os.getenv("HOPSWORKS_API_KEY"),
-            project=os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model"),
-        )
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group("aqi_features", version=1)
-        df = fg.read()
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        return df
-    except Exception:
-        return None
+    return forecasts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR NAVIGATION
+# SHAP EXPLAINABILITY
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.sidebar:
-    st.markdown("### 🌬️ AQI Forecaster")
-    st.markdown("**Rawalpindi / Islamabad**")
-    st.markdown("---")
-
-    page = st.radio(
-        "Navigate",
-        ["📊 Forecast", "📈 Historical", "🔍 Explainability", "ℹ️ About"],
-        label_visibility="collapsed",
-    )
-
-    st.markdown("---")
-    st.caption("Data refreshes every hour via GitHub Actions.")
-    st.caption("Model: Ridge Regression | Features: Weather + Pollutants")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — FORECAST
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_forecast():
-    st.title("📊 AQI Forecast")
-    st.markdown("Predicted Air Quality Index for Rawalpindi at +24h, +48h, and +72h.")
-
-    with st.spinner("Loading latest predictions..."):
-        data = load_predictions()
-
-    if data is None:
-        st.error("Predictions unavailable. The inference pipeline may not have run yet.")
-        st.info("Run `python pipelines/inference_pipeline.py` to generate predictions.")
-        return
-
-    preds = data["predictions"]
-    generated_at = data.get("generated_at", "Unknown")
-    based_on = data.get("based_on_data_at", "Unknown")
-    source = data.get("_source", "unknown")
-
-    # ── Freshness banner ──────────────────────────────────────────────────────
-    try:
-        gen_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
-        age_hours = (datetime.now(timezone.utc) - gen_dt).total_seconds() / 3600
-        if age_hours < 2:
-            st.success(f"✅ Predictions fresh — generated {age_hours:.1f}h ago")
-        elif age_hours < 6:
-            st.warning(f"⚠️ Predictions are {age_hours:.1f}h old — next update coming soon")
-        else:
-            st.error(f"🔴 Predictions are {age_hours:.1f}h old — pipeline may be down")
-    except Exception:
-        st.info(f"Generated at: {generated_at}")
-
-    st.caption(f"Based on data at: {based_on} | Source: {source}")
-    st.markdown("---")
-
-    # ── Metric cards ──────────────────────────────────────────────────────────
-    horizons = [
-        ("24h", preds.get("aqi_pred_24h", 0)),
-        ("48h", preds.get("aqi_pred_48h", 0)),
-        ("72h", preds.get("aqi_pred_72h", 0)),
-    ]
-
-    cols = st.columns(3)
-    for col, (label, aqi_val) in zip(cols, horizons):
-        cat = get_aqi_category(aqi_val)
-        with col:
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: {cat['color']};">
-                <div class="metric-label">+{label} Forecast</div>
-                <div class="metric-value">{aqi_val:.0f}</div>
-                <div class="metric-category" style="color: {cat['color']};">
-                    {cat['label']}
-                </div>
-                <div class="metric-advice">{cat['advice']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Forecast bar chart ────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">Forecast Trend</div>', unsafe_allow_html=True)
-
-    aqi_vals = [v for _, v in horizons]
-    colors   = [get_aqi_category(v)["color"] for v in aqi_vals]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=[f"+{h}" for h, _ in horizons],
-        y=aqi_vals,
-        marker_color=colors,
-        text=[f"{v:.0f}" for v in aqi_vals],
-        textposition="outside",
-        width=0.4,
-    ))
-
-    # AQI threshold lines
-    thresholds = [(50, "Good", "#00E400"), (100, "Moderate", "#FFFF00"),
-                  (150, "Unhealthy SG", "#FF7E00"), (200, "Unhealthy", "#FF0000")]
-    for threshold, label, color in thresholds:
-        fig.add_hline(
-            y=threshold, line_dash="dot", line_color=color,
-            annotation_text=label, annotation_position="right",
-            line_width=1,
-        )
-
-    fig.update_layout(
-        xaxis_title="Forecast Horizon",
-        yaxis_title="AQI",
-        yaxis=dict(range=[0, max(max(aqi_vals) * 1.3, 220)]),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        showlegend=False,
-        height=380,
-        margin=dict(t=20, b=40, l=40, r=80),
-        font=dict(family="Inter, sans-serif", size=13),
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="#f0f0f0")
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── AQI scale reference ───────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown('<div class="section-header">AQI Reference Scale</div>', unsafe_allow_html=True)
-
-    ref_cols = st.columns(len(AQI_CATEGORIES))
-    for col, cat in zip(ref_cols, AQI_CATEGORIES):
-        with col:
-            st.markdown(f"""
-            <div style="background:{cat['color']}22; border-radius:8px; padding:10px;
-                        border-top: 4px solid {cat['color']}; text-align:center;">
-                <div style="font-weight:600; font-size:13px;">{cat['label']}</div>
-                <div style="font-size:12px; color:#555;">{cat['min']}–{cat['max']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — HISTORICAL
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_historical():
-    st.title("📈 Historical AQI")
-    st.markdown("Hourly AQI readings from the Hopsworks feature store.")
-
-    with st.spinner("Loading historical data..."):
-        df = load_historical()
-
-    if df is None or len(df) == 0:
-        st.error("Historical data unavailable. Check your Hopsworks connection.")
-        return
-
-    st.success(f"Loaded {len(df):,} hourly readings from {df['timestamp'].min().date()} to {df['timestamp'].max().date()}")
-
-    # ── Controls ──────────────────────────────────────────────────────────────
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        days_back = st.slider("Show last N days", min_value=3, max_value=21, value=7, step=1)
-    with col2:
-        show_pollutants = st.checkbox("Overlay PM2.5", value=False)
-
-    cutoff = df["timestamp"].max() - pd.Timedelta(days=days_back)
-    df_filtered = df[df["timestamp"] >= cutoff].copy()
-
-    # ── Main AQI line chart ───────────────────────────────────────────────────
-    fig = go.Figure()
-
-    # Colour the line by AQI category using segments
-    fig.add_trace(go.Scatter(
-        x=df_filtered["timestamp"],
-        y=df_filtered["aqi"],
-        mode="lines",
-        name="AQI",
-        line=dict(color="#2563EB", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(37, 99, 235, 0.08)",
-    ))
-
-    if show_pollutants and "pm25" in df_filtered.columns:
-        fig.add_trace(go.Scatter(
-            x=df_filtered["timestamp"],
-            y=df_filtered["pm25"],
-            mode="lines",
-            name="PM2.5",
-            line=dict(color="#DC2626", width=1.5, dash="dot"),
-        ))
-
-    # Threshold bands
-    for threshold, label, color in [
-        (50, "Good", "#00E400"), (100, "Moderate", "#FFFF00"),
-        (150, "Unhealthy SG", "#FF7E00"), (200, "Unhealthy", "#FF0000"),
-    ]:
-        fig.add_hline(
-            y=threshold, line_dash="dot", line_color=color,
-            line_width=1,
-            annotation_text=label, annotation_position="right",
-        )
-
-    fig.update_layout(
-        xaxis_title="Date",
-        yaxis_title="AQI",
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        height=420,
-        margin=dict(t=20, b=40, l=40, r=80),
-        font=dict(family="Inter, sans-serif", size=13),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified",
-    )
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(gridcolor="#f0f0f0")
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Summary stats ─────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown('<div class="section-header">Summary Statistics</div>', unsafe_allow_html=True)
-
-    s = df_filtered["aqi"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Average AQI", f"{s.mean():.1f}")
-    m2.metric("Max AQI", f"{s.max():.0f}")
-    m3.metric("Min AQI", f"{s.min():.0f}")
-    m4.metric("Std Dev", f"{s.std():.1f}")
-
-    # ── Raw data table ────────────────────────────────────────────────────────
-    with st.expander("View raw data"):
-        show_cols = ["timestamp", "aqi", "pm25", "pm10", "temperature", "humidity", "wind_speed"]
-        show_cols = [c for c in show_cols if c in df_filtered.columns]
-        st.dataframe(
-            df_filtered[show_cols].sort_values("timestamp", ascending=False).head(200),
-            use_container_width=True,
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — EXPLAINABILITY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_explainability():
-    st.title("🔍 Model Explainability")
-    st.markdown("SHAP (SHapley Additive exPlanations) shows which features drive each prediction.")
-
-    with st.spinner("Loading model and computing SHAP values..."):
-        result = compute_shap()
-
-    if result is None:
-        st.warning("SHAP computation requires the model and feature data to be available.")
-        st.info("Make sure you have run the training pipeline and inference pipeline first.")
-        return
-
-    shap_vals, feature_names, X_sample = result
-
-    # ── Global feature importance ─────────────────────────────────────────────
-    st.markdown('<div class="section-header">Global Feature Importance (Mean |SHAP|)</div>',
-                unsafe_allow_html=True)
-    st.caption("Averaged across all test samples and forecast horizons. Higher = more influential.")
-
-    mean_abs_shap = np.abs(shap_vals).mean(axis=0)
-    importance_df = pd.DataFrame({
-        "Feature": feature_names,
-        "Mean |SHAP|": mean_abs_shap,
-    }).sort_values("Mean |SHAP|", ascending=True).tail(15)
-
-    fig = go.Figure(go.Bar(
-        x=importance_df["Mean |SHAP|"],
-        y=importance_df["Feature"],
-        orientation="h",
-        marker_color="#2563EB",
-    ))
-    fig.update_layout(
-        xaxis_title="Mean |SHAP| value",
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        height=420,
-        margin=dict(t=10, b=40, l=160, r=20),
-        font=dict(family="Inter, sans-serif", size=13),
-    )
-    fig.update_xaxes(gridcolor="#f0f0f0")
-    fig.update_yaxes(showgrid=False)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Per-horizon breakdown ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown('<div class="section-header">Importance by Forecast Horizon</div>',
-                unsafe_allow_html=True)
-
-    horizon_labels = ["+24h", "+48h", "+72h"]
-    tabs = st.tabs(horizon_labels)
-
-    for tab, h_idx, h_label in zip(tabs, range(3), horizon_labels):
-        with tab:
-            h_shap = np.abs(shap_vals[:, :, h_idx]).mean(axis=0) if shap_vals.ndim == 3 else np.abs(shap_vals).mean(axis=0)
-            h_df = pd.DataFrame({
-                "Feature": feature_names,
-                "Mean |SHAP|": h_shap,
-            }).sort_values("Mean |SHAP|", ascending=True).tail(10)
-
-            fig_h = go.Figure(go.Bar(
-                x=h_df["Mean |SHAP|"],
-                y=h_df["Feature"],
-                orientation="h",
-                marker_color="#2563EB",
-            ))
-            fig_h.update_layout(
-                xaxis_title="Mean |SHAP|",
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                height=320,
-                margin=dict(t=10, b=30, l=160, r=20),
-                font=dict(family="Inter, sans-serif", size=12),
-            )
-            fig_h.update_xaxes(gridcolor="#f0f0f0")
-            fig_h.update_yaxes(showgrid=False)
-            st.plotly_chart(fig_h, use_container_width=True)
-
-    # ── Explainer note ────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.info(
-        "**How to read this:** SHAP values measure each feature's contribution to the "
-        "prediction. A high SHAP value means the feature pushed the AQI prediction higher; "
-        "a negative value means it pushed it lower. The bar chart shows the average magnitude "
-        "across all predictions — larger bars = more important features overall."
-    )
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def compute_shap():
-    """Compute SHAP values for the current model. Cached for 1 hour."""
+@st.cache_data(ttl=3600, show_spinner="Computing SHAP values...")
+def compute_shap(_model, _imputer, df, feature_cols):
+    """Compute SHAP values for the latest prediction."""
     try:
         import shap
-        import os
-        import joblib
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=ROOT / ".env")
+        df_feat  = engineer_lag_features(df)
+        feat_cols = [c for c in feature_cols if c in df_feat.columns]
+        X        = df_feat[feat_cols].dropna().values
+        X        = _imputer.transform(X)
 
-        import hopsworks
-        project = hopsworks.login(
-            api_key_value=os.getenv("HOPSWORKS_API_KEY"),
-            project=os.getenv("HOPSWORKS_PROJECT_NAME", "aqi_predictor_model"),
-        )
-
-        # Load model
-        mr = project.get_model_registry()
-        hw_model = mr.get_model(name="aqi_forecaster")
-        model_dir = Path(hw_model.download())
-        model = joblib.load(model_dir / "model.pkl")
-        feature_cols = json.loads((model_dir / "feature_columns.json").read_text())
-
-        # Load features for background data
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group("aqi_features", version=1)
-        df = fg.read()
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        # Engineer same lag features as training
-        aqi = df["aqi"]
-        for lag_h in [1, 6, 24, 48, 72]:
-            df[f"aqi_lag_{lag_h}h"] = aqi.shift(lag_h)
-        df["aqi_rolling_mean_6h"]  = aqi.shift(1).rolling(6).mean()
-        df["aqi_rolling_mean_24h"] = aqi.shift(1).rolling(24).mean()
-        df["aqi_rolling_std_24h"]  = aqi.shift(1).rolling(24).std()
-        df["aqi_rolling_mean_7d"]  = aqi.shift(1).rolling(24 * 7).mean()
-        if "pm25" in df.columns:
-            for lag_h in [1, 24]:
-                df[f"pm25_lag_{lag_h}h"] = df["pm25"].shift(lag_h)
-        if "wind_speed" in df.columns:
-            df["wind_lag_1h"] = df["wind_speed"].shift(1)
-
-        df = df.dropna(subset=["aqi_lag_72h"])
-
-        # Align to model's feature set
-        for col in feature_cols:
-            if col not in df.columns:
-                df[col] = np.nan
-        X = df[feature_cols].fillna(df[feature_cols].median()).values
-
-        # Use a small sample for speed (SHAP is slow on large datasets)
-        n_sample = min(50, len(X))
-        X_sample = X[:n_sample]
-
-        # SHAP explainer — TreeExplainer for RF/XGB, LinearExplainer for Ridge
-        model_type = json.loads((model_dir / "model_info.json").read_text()).get("model_type", "")
-        if model_type in ("ridge",):
-            explainer = shap.LinearExplainer(
-                model.estimators_[0],
-                X_sample,
-                feature_names=feature_cols,
-            )
-            shap_vals_list = np.stack([
-                explainer.shap_values(X_sample)
-                for est in model.estimators_
-            ], axis=-1)
+        # Use TreeExplainer for tree-based models, LinearExplainer for Ridge
+        model_type = type(_model).__name__
+        if "Ridge" in model_type or "Pipeline" in model_type:
+            # For Pipeline with Ridge
+            try:
+                inner = _model.named_steps["model"]
+                scaler = _model.named_steps["scaler"]
+                X_scaled = scaler.transform(X)
+                explainer   = shap.LinearExplainer(inner, X_scaled)
+                shap_values = explainer.shap_values(X_scaled[-1:])
+            except:
+                explainer   = shap.Explainer(_model.predict, X[-50:])
+                shap_values = explainer(X[-1:]).values
         else:
-            explainer = shap.TreeExplainer(model.estimators_[0])
-            shap_vals_list = np.stack([
-                explainer.shap_values(X_sample)
-                for est in model.estimators_
-            ], axis=-1)
+            explainer   = shap.TreeExplainer(_model)
+            shap_values = explainer.shap_values(X[-1:])
 
-        return shap_vals_list, feature_cols, X_sample
+        shap_df = pd.DataFrame({
+            "feature": feat_cols,
+            "shap_value": shap_values[0] if len(shap_values.shape) > 1 else shap_values.flatten(),
+        }).sort_values("shap_value", key=abs, ascending=False).head(15)
 
+        return shap_df
     except Exception as e:
-        st.error(f"SHAP computation failed: {e}")
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — ABOUT
+# CUSTOM CSS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_about():
-    st.title("ℹ️ About This Project")
-
+def inject_css():
     st.markdown("""
-    ### AQI Forecaster — Rawalpindi / Islamabad
+    <style>
+    /* Main background */
+    .main { background-color: #F8F9FA; }
 
-    This project is a **production-grade MLOps pipeline** that forecasts Air Quality Index (AQI)
-    up to 72 hours ahead for Rawalpindi and Islamabad, Pakistan — one of the most
-    air-pollution-affected regions in South Asia.
-    """)
-
-    st.markdown("---")
-
-    # ── Architecture ──────────────────────────────────────────────────────────
-    st.markdown("### 🏗️ Architecture")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("""
-        **Data Pipeline (hourly, automated)**
-        - Fetches AQI from AQICN API
-        - Fetches weather from OpenWeatherMap API
-        - Engineers features (lag, rolling, cyclical time encoding)
-        - Writes to Hopsworks Feature Store
-
-        **Training Pipeline (on-demand)**
-        - Reads from Feature Store
-        - Trains Ridge, Random Forest, XGBoost, LSTM
-        - Evaluates with temporal train/test split
-        - Registers best model to Hopsworks Model Registry
-        """)
-
-    with col2:
-        st.markdown("""
-        **Inference Pipeline (hourly, automated)**
-        - Loads latest model from Model Registry
-        - Fetches most recent features from Feature Store
-        - Generates +24h, +48h, +72h predictions
-        - Writes predictions to Hopsworks + local backup
-
-        **This App**
-        - Reads predictions from Hopsworks / local JSON
-        - Displays forecast, historical trends, SHAP explainability
-        - Deployed on Streamlit Community Cloud
-        - Auto-refreshes as new predictions arrive
-        """)
-
-    st.markdown("---")
-
-    # ── Tech stack ────────────────────────────────────────────────────────────
-    st.markdown("### 🛠️ Tech Stack")
-
-    tech = {
-        "Feature Store": "Hopsworks (serverless, free tier)",
-        "Model Registry": "Hopsworks Model Registry",
-        "ML Models": "scikit-learn, XGBoost, TensorFlow/Keras",
-        "Explainability": "SHAP (SHapley Additive exPlanations)",
-        "Orchestration": "GitHub Actions (hourly cron jobs)",
-        "Dashboard": "Streamlit + Plotly",
-        "Data Sources": "AQICN API + OpenWeatherMap API",
-        "Language": "Python 3.11",
+    /* Metric cards */
+    .metric-card {
+        background: white;
+        border-radius: 16px;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        border-top: 4px solid;
+        margin-bottom: 8px;
+    }
+    .metric-card .aqi-value {
+        font-size: 3rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+    .metric-card .day-label {
+        font-size: 0.85rem;
+        color: #666;
+        margin-bottom: 8px;
+        font-weight: 500;
+    }
+    .metric-card .cat-label {
+        font-size: 0.95rem;
+        font-weight: 600;
+        margin-top: 6px;
     }
 
-    for k, v in tech.items():
-        st.markdown(f"- **{k}:** {v}")
+    /* Alert box */
+    .alert-box {
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin: 8px 0;
+        border-left: 5px solid;
+        font-weight: 500;
+    }
 
+    /* Section headers */
+    .section-header {
+        font-size: 1.3rem;
+        font-weight: 700;
+        color: #1A1A2E;
+        margin: 24px 0 12px;
+        padding-bottom: 6px;
+        border-bottom: 2px solid #E0E0E0;
+    }
+
+    /* Sidebar */
+    .css-1d391kg { background-color: #1A1A2E; }
+
+    /* Hide Streamlit branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    inject_css()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/32/Flag_of_Pakistan.svg/200px-Flag_of_Pakistan.svg.png", width=60)
+        st.title("🌫️ AQI Forecast")
+        st.markdown("**Islamabad, Pakistan**")
+        st.markdown("---")
+        st.markdown("### About")
+        st.markdown("""
+        Real-time 3-day Air Quality Index forecasting using machine learning.
+
+        **Data sources:**
+        - AQICN API (live AQI)
+        - OpenWeather API (weather)
+        - US Embassy Islamabad monitor
+
+        **Model:** Trained on 2019–2026 historical data
+        """)
+        st.markdown("---")
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+        st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}*")
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.title("🌫️ Islamabad Air Quality Forecast")
+    st.markdown("Machine learning powered 3-day AQI prediction using real-time sensor data")
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    with st.spinner("Loading data..."):
+        try:
+            df                       = load_features()
+            model, feature_cols, imputer = load_model()
+        except Exception as e:
+            st.error(f"Failed to load data: {e}")
+            st.info("Check your Hopsworks API key and project name in secrets.")
+            return
+
+    latest_row = df.iloc[-1]
+    current_aqi = float(latest_row["aqi"])
+    current_cat = get_aqi_category(current_aqi)
+
+    # ── Current AQI banner ────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:{current_cat['bg']};border-radius:16px;padding:24px;
+                border-left:8px solid {current_cat['color']};margin-bottom:24px">
+        <div style="display:flex;align-items:center;gap:16px">
+            <div style="font-size:3.5rem">{current_cat['emoji']}</div>
+            <div>
+                <div style="font-size:0.9rem;color:#555;font-weight:500">CURRENT AQI · ISLAMABAD US EMBASSY</div>
+                <div style="font-size:3rem;font-weight:800;color:{current_cat['color']};line-height:1">{current_aqi}</div>
+                <div style="font-size:1.1rem;font-weight:600;color:{current_cat['color']}">{current_cat['label']}</div>
+            </div>
+            <div style="margin-left:auto;text-align:right">
+                <div style="font-size:0.85rem;color:#666">PM2.5</div>
+                <div style="font-size:1.8rem;font-weight:700">{latest_row.get('pm25', 'N/A')}</div>
+                <div style="font-size:0.75rem;color:#888">µg/m³</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 3-Day Forecast ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📅 3-Day Forecast</div>', unsafe_allow_html=True)
+
+    try:
+        forecasts = generate_3day_forecast(df, model, feature_cols, imputer)
+
+        cols = st.columns(3)
+        for i, forecast in enumerate(forecasts):
+            with cols[i]:
+                cat = forecast["cat"]
+                st.markdown(f"""
+                <div class="metric-card" style="border-top-color:{cat['color']}">
+                    <div class="day-label">{forecast['date']}</div>
+                    <div class="aqi-value" style="color:{cat['color']}">{forecast['aqi']}</div>
+                    <div style="font-size:1.5rem;margin:4px 0">{cat['emoji']}</div>
+                    <div class="cat-label" style="color:{cat['color']}">{cat['label']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Forecast trend chart
+        forecast_df = pd.DataFrame([{
+            "Day":  f["date"],
+            "AQI":  f["aqi"],
+            "Category": f["cat"]["label"],
+            "Color": f["cat"]["color"],
+        } for f in forecasts])
+
+        # Add today's reading
+        today_row = pd.DataFrame([{
+            "Day":  "Today",
+            "AQI":  current_aqi,
+            "Category": current_cat["label"],
+            "Color": current_cat["color"],
+        }])
+        chart_df = pd.concat([today_row, forecast_df], ignore_index=True)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=chart_df["Day"], y=chart_df["AQI"],
+            mode="lines+markers+text",
+            text=chart_df["AQI"],
+            textposition="top center",
+            line=dict(color="#1565C0", width=3),
+            marker=dict(size=12, color=chart_df["Color"], line=dict(width=2, color="white")),
+            textfont=dict(size=13, color="#333"),
+        ))
+
+        # AQI category bands
+        bands = [(0, 50, "#E8F5E9"), (51, 100, "#FFFDE7"), (101, 150, "#FFF3E0"),
+                 (151, 200, "#FFEBEE"), (201, 300, "#F3E5F5")]
+        for lo, hi, color in bands:
+            fig.add_hrect(y0=lo, y1=hi, fillcolor=color, opacity=0.4, line_width=0)
+
+        fig.update_layout(
+            title="AQI Trend: Today + 3-Day Forecast",
+            xaxis_title="", yaxis_title="AQI",
+            plot_bgcolor="white", paper_bgcolor="white",
+            height=320, margin=dict(t=40, b=20, l=40, r=20),
+            yaxis=dict(range=[0, max(300, max(chart_df["AQI"]) + 30)]),
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Forecast generation failed: {e}")
+
+    # ── Hazard Alerts ─────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">⚠️ Health Alerts</div>', unsafe_allow_html=True)
+
+    all_aqi = [current_aqi] + [f["aqi"] for f in forecasts]
+    max_aqi = max(all_aqi)
+    max_cat = get_aqi_category(max_aqi)
+
+    if max_aqi <= 50:
+        st.success("✅ Air quality is good for the next 3 days. Enjoy outdoor activities!")
+    elif max_aqi <= 100:
+        st.warning("⚠️ Air quality is moderate. Unusually sensitive people should consider reducing prolonged outdoor exertion.")
+    elif max_aqi <= 150:
+        st.warning(f"🟠 Unhealthy for Sensitive Groups (AQI up to {max_aqi:.0f}). People with respiratory or heart conditions should limit outdoor activity.")
+    elif max_aqi <= 200:
+        st.error(f"🔴 Unhealthy conditions expected (AQI up to {max_aqi:.0f}). Everyone should reduce prolonged outdoor exertion. Wear an N95 mask outdoors.")
+    elif max_aqi <= 300:
+        st.error(f"🟣 Very Unhealthy (AQI up to {max_aqi:.0f}). Avoid all outdoor activity. Keep windows closed. Use air purifiers indoors.")
+    else:
+        st.error(f"☠️ HAZARDOUS conditions (AQI up to {max_aqi:.0f}). Stay indoors. This is a health emergency. Wear N95 mask if you must go out.")
+
+    # Health advice table
+    advice_data = {
+        "Group": ["General Public", "Children & Elderly", "Asthma / Heart Conditions", "Athletes / Outdoor Workers"],
+        "Recommendation": [
+            "Limit prolonged outdoor activity" if max_aqi > 100 else "Normal activity OK",
+            "Avoid outdoor play" if max_aqi > 100 else "Normal activity OK",
+            "Stay indoors, use inhaler as needed" if max_aqi > 100 else "Monitor symptoms",
+            "Reschedule outdoor training" if max_aqi > 100 else "Normal activity OK",
+        ]
+    }
+    st.dataframe(pd.DataFrame(advice_data), use_container_width=True, hide_index=True)
+
+    # ── Historical AQI Trend ──────────────────────────────────────────────────
+    st.markdown('<div class="section-header">📈 Historical AQI Trend</div>', unsafe_allow_html=True)
+
+    hist_df = df[df["aqi"] > 75].tail(90).copy()  # last 90 real readings
+    if len(hist_df) > 5:
+        fig2 = px.line(
+            hist_df, x="timestamp", y="aqi",
+            title="Last 90 Days — Daily AQI",
+            labels={"aqi": "AQI", "timestamp": "Date"},
+            color_discrete_sequence=["#1565C0"],
+        )
+        fig2.add_hline(y=100, line_dash="dash", line_color="#FFD600", annotation_text="Moderate")
+        fig2.add_hline(y=150, line_dash="dash", line_color="#FF6D00", annotation_text="Unhealthy SG")
+        fig2.add_hline(y=200, line_dash="dash", line_color="#D50000", annotation_text="Unhealthy")
+        fig2.update_layout(
+            plot_bgcolor="white", paper_bgcolor="white",
+            height=300, margin=dict(t=40, b=20, l=40, r=20),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Pollutant Breakdown ───────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🧪 Pollutant Breakdown</div>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+
+    pollutants = {
+        "PM2.5": latest_row.get("pm25"),
+        "PM10":  latest_row.get("pm10"),
+        "NO2":   latest_row.get("no2"),
+        "O3":    latest_row.get("o3"),
+        "SO2":   latest_row.get("so2"),
+        "CO":    latest_row.get("co"),
+    }
+    available = {k: v for k, v in pollutants.items() if v is not None and not np.isnan(float(v))}
+
+    with col1:
+        if available:
+            poll_df = pd.DataFrame(list(available.items()), columns=["Pollutant", "Value (µg/m³)"])
+            fig3 = px.bar(
+                poll_df, x="Pollutant", y="Value (µg/m³)",
+                title="Current Pollutant Levels",
+                color="Value (µg/m³)",
+                color_continuous_scale="RdYlGn_r",
+            )
+            fig3.update_layout(
+                plot_bgcolor="white", paper_bgcolor="white",
+                height=300, margin=dict(t=40, b=20, l=40, r=20),
+                showlegend=False, coloraxis_showscale=False,
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("Individual pollutant data not available for current reading. Only PM2.5 is reported by the Islamabad US Embassy station.")
+            st.metric("PM2.5", f"{latest_row.get('pm25', 'N/A')} µg/m³", help="Fine particulate matter — primary AQI driver")
+
+    with col2:
+        st.markdown("**What each pollutant means:**")
+        st.markdown("""
+        | Pollutant | Source | Health Impact |
+        |-----------|--------|---------------|
+        | **PM2.5** | Vehicle exhaust, burning | Penetrates lungs deeply |
+        | **PM10** | Dust, construction | Respiratory irritation |
+        | **NO2** | Traffic, industry | Asthma trigger |
+        | **O3** | Sunlight + pollutants | Lung damage |
+        | **SO2** | Industry, power plants | Breathing difficulty |
+        | **CO** | Incomplete combustion | Reduces oxygen in blood |
+        """)
+
+    # ── Weather Context ───────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🌤️ Current Weather Conditions</div>', unsafe_allow_html=True)
+
+    w_cols = st.columns(4)
+    weather_metrics = [
+        ("🌡️ Temperature", f"{latest_row.get('temperature', 'N/A')}°C"),
+        ("💧 Humidity",    f"{latest_row.get('humidity', 'N/A')}%"),
+        ("💨 Wind Speed",  f"{latest_row.get('wind_speed', 'N/A')} m/s"),
+        ("🔵 Pressure",    f"{latest_row.get('pressure', 'N/A')} hPa"),
+    ]
+    for col, (label, value) in zip(w_cols, weather_metrics):
+        with col:
+            st.metric(label, value)
+
+    # ── SHAP Explainability ───────────────────────────────────────────────────
+    st.markdown('<div class="section-header">🔍 Why this prediction? (SHAP Explainability)</div>', unsafe_allow_html=True)
+    st.markdown("SHAP values show which features most influenced today's AQI prediction. Positive values push AQI higher; negative values push it lower.")
+
+    with st.spinner("Computing SHAP values..."):
+        shap_df = compute_shap(model, imputer, df, feature_cols)
+
+    if shap_df is not None and len(shap_df) > 0:
+        shap_df["direction"] = shap_df["shap_value"].apply(lambda x: "Increases AQI" if x > 0 else "Decreases AQI")
+        shap_df["abs_value"] = shap_df["shap_value"].abs()
+
+        fig4 = px.bar(
+            shap_df.head(12),
+            x="shap_value", y="feature",
+            orientation="h",
+            color="direction",
+            color_discrete_map={"Increases AQI": "#D50000", "Decreases AQI": "#00C853"},
+            title="Top Feature Contributions to Latest Prediction",
+            labels={"shap_value": "SHAP Value (impact on AQI)", "feature": "Feature"},
+        )
+        fig4.update_layout(
+            plot_bgcolor="white", paper_bgcolor="white",
+            height=420, margin=dict(t=40, b=20, l=160, r=20),
+            yaxis=dict(autorange="reversed"),
+            legend_title="Effect",
+        )
+        st.plotly_chart(fig4, use_container_width=True)
+
+        # Top 3 explanation in plain English
+        top3 = shap_df.head(3)
+        st.markdown("**In plain English:**")
+        for _, row in top3.iterrows():
+            direction = "increasing" if row["shap_value"] > 0 else "decreasing"
+            st.markdown(f"- **{row['feature']}** is {direction} the predicted AQI by `{abs(row['shap_value']):.1f}` points")
+    else:
+        st.info("SHAP analysis requires the `shap` package. Run: `pip install shap`")
+
+    # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")
-
-    # ── Model info ────────────────────────────────────────────────────────────
-    st.markdown("### 📊 Model Details")
     st.markdown("""
-    | Property | Value |
-    |---|---|
-    | Task | Multi-output regression (3 horizons) |
-    | Targets | AQI at +24h, +48h, +72h |
-    | Primary metric | Mean Absolute Error (MAE) |
-    | Train/test split | Temporal (no shuffling) |
-    | Feature count | 29 engineered features |
-    | Data frequency | 1 observation per hour |
-    """)
-
-    st.info(
-        "**Note on metrics:** The model was trained on ~21 days of initial data. "
-        "MAE will improve automatically as more hourly data accumulates via the "
-        "automated GitHub Actions pipeline."
-    )
-
-    st.markdown("---")
-    st.caption("Built as part of an MLOps internship project. Data is real and refreshed hourly.")
+    <div style='text-align:center;color:#888;font-size:0.85rem'>
+        Built with ❤️ using Streamlit · Data: AQICN & US Embassy Islamabad ·
+        Model: Scikit-learn · Feature Store: Hopsworks
+    </div>
+    """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ROUTER
-# ══════════════════════════════════════════════════════════════════════════════
-
-if page == "📊 Forecast":
-    render_forecast()
-elif page == "📈 Historical":
-    render_historical()
-elif page == "🔍 Explainability":
-    render_explainability()
-elif page == "ℹ️ About":
-    render_about()
+if __name__ == "__main__":
+    main()
