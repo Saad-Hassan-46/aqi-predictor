@@ -1,0 +1,38 @@
+name: Deploy Streamlit App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "models/**"
+      - "requirements.txt"
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install app dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r app/requirements.txt
+
+      - name: Validate Streamlit entrypoint imports
+        run: python -m py_compile app/app.py
+
+      - name: Deployment note
+        run: |
+          echo "Connect this repository to Streamlit Community Cloud."
+          echo "Set app entrypoint to app/app.py and add secrets in Streamlit settings."

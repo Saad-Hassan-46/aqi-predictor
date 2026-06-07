@@ -1,0 +1,34 @@
+# Secrets
+.env
+*.env
+API.txt
+app/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+notebooks/*.ipynb
+
+# Data (large files go in Hopsworks, not git)
+data/*.csv
+data/*.parquet
+data/*.json
+
+# Models (stored in Hopsworks model registry, not git)
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.keras
+
+# OS
+.DS_Store
+Thumbs.db

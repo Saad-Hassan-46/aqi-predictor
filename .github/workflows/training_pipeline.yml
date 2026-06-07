@@ -1,0 +1,59 @@
+# .github/workflows/training_pipeline.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs the training pipeline once daily to retrain the model on the
+# latest data and register the new version in Hopsworks Model Registry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Training Pipeline (Daily)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # every day at 02:00 UTC (after hourly data has accumulated)
+  workflow_dispatch:       # allow manual trigger from GitHub UI
+
+jobs:
+  run-training-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # training takes longer than feature pipeline
+
+    steps:
+      # ── 1. Checkout code ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install confluent-kafka==2.3.0
+          pip install "hopsworks[python]==4.7.*"
+          pip install -r requirements.txt
+
+      # ── 4. Install XGBoost (may not be in requirements.txt) ───────────────
+      - name: Install XGBoost
+        run: pip install xgboost joblib
+
+      # ── 5. Run training pipeline ───────────────────────────────────────────
+      - name: Run training pipeline
+        env:
+          HOPSWORKS_API_KEY:      ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT_NAME: ${{ secrets.HOPSWORKS_PROJECT_NAME }}
+        run: python pipelines/training_pipeline.py --lookback 7
+
+      # ── 6. Report status ───────────────────────────────────────────────────
+      - name: Report status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "Training pipeline completed successfully at $(date -u)"
+          else
+            echo "Training pipeline FAILED at $(date -u)"
+            exit 1
+          fi
